@@ -1,0 +1,481 @@
+---
+title: "Geospatial Data Analysis Final Project"
+author: "Carlo Greß"
+date: "2024-04-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+*************************************************************************************************************************************
+Course: Geospatial Analysis for Data Science
+Instructor: Alexandra Kapp
+Author: Carlo Greß 
+
+Final Project: The Impact of Polling Station Proximity on Voter Turnout in Germany
+
+*************************************************************************************************************************************
+# Introduction and previous findings
+
+The determinants of voter turnout represent a prominent topic within social sciences. Historically, research has primarily concentrated on socio-demographic factors influencing this phenomenon. Diverging from previous studies, this research project investigates the impact of geographic proximity to polling stations on voter turnout across Berlin's voting districts during the 2021 German federal election (the latest federal election in Germany). Several studies suggested that geographical and other environmental factors as distance from polling stations (Haspel/Knotts, 2005; Orford et al., 2011), their opening hours (Garmann, 2017), or even the weather during election day (Gomez et al., 2007) do play a role for voters’ willingness to cast their ballot. In contrast to studies focusing on demographic determinants, these articles emphasize the costs of voting. It seems reasonable to expect that a smaller geogrpahic distance to the polling station leads to higher turnour rates due to the reduced costs of voting.
+
+The required data sets are sourced from various providers. The geographic location of polling stations (point geometry) and the electoral district boundaries (polygons) are provided in two separate data sets by the Amt für Statistik Berlin-Brandenburg (2021). Each observation in both data sets refers to a single electoral district/polling station (in total, there are 2,257 voting districts). Since there is exactly on polling station per electoral district and the data includes unique identifier variables, the data sets are well-suited for merging. The population density is provided by the open data portal of the city of Berlin (2021). This data is provided on a more granular level, the RBS-blocks. Each observation contains information on the geographic block size, the respective population size and the resulting population density. Since each electoral districts consists of several RBS-blocks, this data set can be facilitated to calculate the population center of each district. For this purpose, a spatial join will be performed. The data on the electoral results and the turnout for each district is again provided by the Amt for Statistik Brandenburg (2021). For reducing complexity, I only consider the data on the secondary vote turnout (which is decisive for the composition of the German parliament).
+
+*************************************************************************************************************************************
+
+All data sets used in this analysis are available here: 
+
+1. Polling stations: https://daten.berlin.de/datensaetze/geometrien-der-wahllokale-f%C3%BCr-die-wahlen-zum-deutschen-bundestag-berlin-und-zum
+
+2. District boundaries: https://www.statistik-berlin-brandenburg.de/opendata/RBS_OD_UWB_AH21.zip
+
+3. Election results/turnout: https://www.wahlen-berlin.de/wahlen/BU2021/AFSPRAES/downloads.html
+ 
+4. Population density: https://fbinter.stadt-berlin.de/fb/wfs/data/senstadt/s06_06ewdichte2021?REQUEST=GetCapabilities&SERVICE=wfs
+
+*************************************************************************************************************************************
+
+The project is structured as follows: The first part serves as a baseline model, evaluating the effect of the geographic distance from each district's geographic center to the polling station on the turnout rate. However, this approach has a limitation. Especially in geographically larger districts located at the outer borders, inhabitants are not evenly distributed within the district. In contrast, a large proportion of the population lives at the border closer to the city center. Hence, using the distance from the geographic center to the polling station will not resemble the "true" distance. In order to overcome this issue, the second part of this project additionally considers the population density of districts. Since the density is available on a more granular level, it is possible to calculate a population weighted centroid that resembles the point geometry with the lowest mean distance from inhabitants. Using this poplation weighted centroid to calculate the distance to the polling station results in a more accurate and robust measure of the true average distance of individuals from the polling station. 
+
+*************************************************************************************************************************************
+
+# 0. Dependencies
+
+```{r}
+library(sf)
+library(tidyverse)
+library(terra)
+library(spatialreg)
+library(spatialEco)
+```
+
+# 1. Data import: Districts, polling stations, and election results
+
+```{r}
+# Spatial data: Polling stations and electoral districts
+
+bezirke <- st_read("RBS_OD_UWB_AH21 (2)/RBS_OD_UWB_AH21.shp")
+wahllokale <- st_read("RBS_OD_Wahllokale_BTW_AH21/RBS_OD_Wahllokale_BTW_AH21.shp")
+
+# Election results
+
+zweitstimme <- read_excel("DL_BE_BU2021.xlsx", 
+                         sheet = "BE_W2")
+
+# Checking CRS alignment
+
+st_crs(bezirke) == st_crs(wahllokale)
+```
+
+Next, I am creating a matching ID (key) for retrieving an exhaustive data set. The existing keys that indicate the districts/polling stations in the four data sets are not perfectly aligned yet. The goal is to adjust the keys so that they are in the same format as the UWB column in the bezirke data frame. This consists of the two digits indicating the district and three digits indicating the polling station.
+
+```{r}
+# Renaming bezirke ID column for consistency
+bezirke$key <- bezirke$UWB
+
+# Polling stations ID: Here, the digits are stored separately, in column "BEZ" are the two digits for the district, column WB includes the three digits. We need a new column combining the information:
+
+wahllokale <- wahllokale %>%
+  mutate(
+    key = paste0(BEZ, WB)
+  )
+
+# Election Results: Here, the information is stored in Bezirksnummer and Wahlbezirk
+
+zweitstimme <- zweitstimme %>%
+  mutate(
+    key = paste0(gsub("\\D", "", Bezirksnummer), gsub("\\D", "", Wahlbezirk))
+  )
+
+# Merging all data sets
+
+bezirke <- bezirke %>%
+  rename(bez_geometry = geometry) |> 
+  as.data.frame()
+
+# Renaming geometry column and filtering for polling stations (no postal vote)
+wahllokale <- wahllokale %>%
+  rename(wahllokale_geometry = geometry) |> 
+  filter(Briefwahl == 0)
+
+spatial_merged <- wahllokale %>%
+  left_join(bezirke %>% dplyr::select(key, bez_geometry), by = "key")
+
+# Now join the result with 'zweitstimme'
+final_df <- spatial_merged %>%
+  left_join(zweitstimme, by = "key")
+
+final_df <- st_set_geometry(final_df, "bez_geometry")
+```
+
+The next chunk creates the variables that are required for the later baseline model: First, it creates the geographic centroid of each district. Next, it calculates the distance between each polling station and the centroid of the corresponding district and stores it as numeric variable.
+
+```{r}
+final_df$centroid <- st_centroid(final_df$bez_geometry)
+
+final_df$distance <- st_distance(final_df$wahllokale_geometry, final_df$centroid, by_element = T)
+
+final_df$distance_numeric <- as.numeric(final_df$distance)
+```
+
+As a quick test, the next chunk creates a plot of all voting districts and their corresponding polling stations (red dots). It already becomes visible that polling stations are commonly at the edges of districts, especially in geographically large districts. Additionally, taking a closer look at the final data set reveals that there are several voting districts in which the location of the polling station is identical. Especially in densely populated areas, the election administration commonly uses the same building (as schools) for several voting district.
+
+```{r}
+district_plot <- ggplot() +
+  geom_sf(data = final_df, aes(geometry = bez_geometry), fill = "antiquewhite4", color = "gray30", size = 0.5, alpha = 0.7) +
+  geom_sf(data = final_df, aes(geometry = wahllokale_geometry), color = "darkred", size = 0.05) +
+  theme_minimal() +  
+  theme(axis.title = element_blank(),  
+        axis.text = element_blank(),  
+        panel.grid.major = element_blank(),  
+        panel.grid.minor = element_blank(),  
+        panel.border = element_blank(),  
+        legend.position = "none")  
+
+district_plot
+ggsave("districts_and_polling_stations.png", plot = district_plot, width = 10, height = 7)
+```
+Next, we will insepect the distribution of our initial distance measure. As we can see, the average distance from the geographic center to the polling station is around 400m. We can aso see that there are some outliers with a large distance. This is most likely due to the larger distange in geogrpahically large districts. In the advanced measure, there hopefully will be less outliers.  
+```{r}
+
+# Calculate the mean of the distance column
+mean_distance <- mean(final_df$distance, na.rm = TRUE)
+
+distance_density <- ggplot(data = final_df, aes(x = distance)) +
+  geom_density(fill = "skyblue", color = "black") +
+  geom_vline(xintercept = mean_distance, linetype = "dashed", color = "black") +
+  labs(title = "", x = "Distance", y = "") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 24, face = "bold"),
+        axis.title = element_text(size = 20, face = "bold"),
+        axis.text = element_text(size = 16),
+        legend.position = "none",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_rect(fill = "white", color = NA))
+
+
+ggsave("distance_density_plot.png", plot = distance_density, width = 12, height = 8, dpi = 300)
+print(distance_density)
+```
+The same measure can be visualised on a map, showing that indeed that the large districts are responsible for the large distances: 
+```{r}
+
+plot <- ggplot(data = final_df) +
+  geom_sf(aes(fill = distance_numeric), color = "grey", size = 0.001) + 
+  scale_fill_viridis_c(
+    option = "D", 
+    begin = 0, 
+    end = 1, 
+    direction = 1, 
+    name = "Distance (m)",
+    guide = guide_colourbar(title.position = "top", title.hjust = 0.5)
+  ) +
+  labs(
+    title = "Distance of Polling Stations to Geographic Center"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 12),
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10),
+    plot.caption = element_text(size = 10),
+    plot.background = element_rect(fill = "white", color = NA),  
+    panel.background = element_rect(fill = "white", color = NA),  
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(), 
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank()
+  )
+
+
+print(plot)
+ggsave("polling_stations_distance.png", plot = plot, width = 8, height = 6, dpi = 300)
+
+```
+
+# 2. Regression with baseline distance measure
+
+## Non-spatial baseline model
+
+The next chunk creates the dependent variable (turnout) and calculates a first (non-spatial) baseline model. One district has been removed since there were no registered voters. The results imply a small but statistically significant effect of the distance measure on turnout (increase in distance is associated with decrease in turnout). However, the subsequent Moran's I test reveals significant signs of spatial autocorrelation, which is accounted for in the following models. 
+
+```{r}
+# Creating turnout variable
+
+final_df <- st_set_geometry(final_df, "bez_geometry")
+
+final_df$turnout <- (final_df$Wählende / final_df$`Wahlberechtigte insgesamt`)*100
+
+# Removing row with NA value for turnout (no voters were registered in that polling station)
+
+final_df <- final_df[-861, ]
+
+formula <- formula(turnout ~ distance_numeric)
+
+model1 <- lm(formula = formula, data = final_df)
+summary(model1)
+
+# List of neihbours
+wts <- final_df |>
+  poly2nb() |>
+  nb2listw(style = "W", zero.policy = T)
+
+# Spatial autocorrelation test: Moran's I
+moran.test(model1$residuals, wts)
+```
+
+## Spatially lagged X model 
+
+After running a model which also includes a lagged version of the distance measure, we can see that there is a sign change between the direct (negative) and indirect impact (positive) on turnout. 
+```{r slx}
+slx_model <- lmSLX(formula, data = final_df, listw = wts)
+
+summary(slx_model)
+
+summary(impacts(slx_model))
+```
+
+Again, we can check whether our model appropriately accounts for spatial autocorrelation by calculating Moran's I. Since the estimate is still positive and significant, there still is spatial autocorrelation in the model. 
+
+```{r slx-autoregression}
+moran.test(slx_model$residuals, wts)
+```
+## Spatial lag model
+
+Next, we are creating a spatial lag model that includes a spatial lag of the outcome variable. Since it seems likely that turnout rates are also dependent on the turnout of neighbouring districts, this seems reasonable. Again, we retrieve a small negative but significant effect of distance on turnout. This effect is only visible after calculating the indirect and direct impacts via Monte Carlo simulation. 
+
+```{r slm}
+
+lag_model <- lagsarlm(
+  formula = formula,
+  data = final_df,
+  listw = wts, 
+  zero.policy = T
+  )
+summary(lag_model, Nagelkerke = TRUE)
+```
+Calculating the impacts:
+
+```{r slm-impacts}
+imp <- impacts(lag_model, listw = wts, R=100) 
+imp
+
+summary(imp, zstats=T)$pzmat
+```
+
+Again, we can rerun Moran's I with the model's residuals, showing that there is no spatial autocorrelation left: 
+
+```{r slm-morans}
+moran.test(lag_model$residuals, wts)
+```
+The AIC test reveals that the lag_model is the best fit. 
+
+```{r AIC}
+AIC(model1, slx_model, lag_model)
+```
+
+
+# Advanced version: Considering the population density of electoral districts
+
+Importing the population density data set
+
+The data on the population density is available on RBS-block level, with is significantly more granular then the voting district level. After importing the data over WFS, we are already storing a geographic centroid for each of the granular block included in the density data. These centroids are later used for calculating a population weighted centroid. Those centroids where the population density is high are weighted accordingly. 
+
+```{r}
+base_url <- "https://fbinter.stadt-berlin.de/fb/wfs/data/senstadt/s06_06ewdichte2021?REQUEST=GetCapabilities&SERVICE=wfs" 
+
+dichte <- st_read(base_url)
+
+dichte$centroid <- st_centroid(dichte$geom)
+```
+The next chunk adds the district ID based on the geographic location of the blocks in the density data. In the second step, the `wt.centroid` function from the `spatialEco` package is used to retrieved population weighted centroids per electoral district, using the column `ew2021` (population number) as weight: 
+
+```{r}
+dichte_with_key <- dichte %>%
+  st_join(final_df %>% dplyr::select(key), join = st_intersects)
+
+dichte_with_key <- st_set_geometry(dichte_with_key, "centroid")
+
+weighted_centroids <- dichte_with_key %>%
+  group_by(key) %>%
+  do({
+    centroid_sf <- st_as_sf(.)
+    data.frame(geometry = wt.centroid(centroid_sf, p = "ew2021", spatial = TRUE))
+  }) %>%
+  st_as_sf() # Convert the result back into an sf object
+```
+
+As a quick check, we can plot the districts with their corresponding polling station (blue), geographic centroid (green), and population weighted centroid (black). 
+```{r}
+
+wahllokale <- st_set_geometry(final_df, "wahllokale_geometry")
+
+ggplot()+ 
+  geom_sf(data = final_df, aes(geometry = bez_geometry)) +
+  geom_sf(data = wahllokale, color = "darkred", size = 0.01)  +
+  geom_sf(data = final_df, aes(geometry = centroid), color = "green", size = 0.01) +
+  geom_sf(data = weighted_centroids, aes(geometry = geometry.geometry), color = "black", size = 0.01)
+```
+
+Some data wrangling: Removing the one district without key and renaming the geometry column for conciseness. 
+```{r}
+weighted_centroids <- weighted_centroids %>%
+ rename(weighted_geom = geometry.geometry)
+
+weighted_centroids <- weighted_centroids %>%
+  filter(!is.na(key))
+```
+
+
+Calculating the improved version of the distance measure: Distance from th weighted population centroid to the respective polling station.
+```{r}
+final_df <- st_set_geometry(final_df, "wahllokale_geometry")
+
+final_df$cleaned_distance <- st_distance(final_df$wahllokale_geometry, weighted_centroids$weighted_geom, by_element = T)
+
+final_df$cleaned_distance_numeric <- as.numeric(final_df$cleaned_distance)
+```
+
+let's briefly compare the distance distribution of the cleaned measure and the inital one: As we can see, the mean value has decreased, and their are fewer outliers with distances > 1000 meters. 
+
+```{r}
+
+# Calculate the mean of the distance column
+mean_cleaned_distance <- mean(final_df$cleaned_distance_numeric, na.rm = TRUE)
+
+cleaned_distance_density <- ggplot(data = final_df, aes(x = cleaned_distance_numeric)) +
+  geom_density(fill = "skyblue", color = "black") +
+  geom_vline(xintercept = mean_cleaned_distance, linetype = "dashed", color = "black") +
+  labs(title = "", x = "Distance", y = "") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 24, face = "bold"),
+        axis.title = element_text(size = 20, face = "bold"),
+        axis.text = element_text(size = 16),
+        legend.position = "none",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_rect(fill = "white", color = NA))
+
+
+ggsave("cleaned_distance_density_plot.png", plot = cleaned_distance_density, width = 12, height = 8, dpi = 300)
+print(cleaned_distance_density)
+```
+
+# 3. Regression with advanced distance measure
+
+Ultimately, we can run our three regression models (non-spatial baseline, spatially lagged x, and spatial lag model) with the corrected distance measure.
+
+## Baseline
+
+From the output below, we can detect a slighty larger negative effect of the distance on turnout: Every additional meter is associated with a 0.004 decrease in turnout. In other words, districts in which the distance of th polling station from the population weighted centroid is 100 meter higher, the expected turnout is 0.4 percentage points lower. This effect is small, but statistically significant.
+
+Again, the Moran's I measure implies that there is spatial autocorrelation, violating the OLS assumptions. 
+
+```{r}
+final_df <- st_set_geometry(final_df, "bez_geometry")
+
+formula <- formula(turnout ~ cleaned_distance_numeric)
+
+model2 <- lm(formula = formula, data = final_df)
+summary(model2)
+
+wts <- final_df |>
+  poly2nb() |>
+  nb2listw(style = "W", zero.policy = T)
+
+moran.test(model2$residuals, wts)
+```
+
+## lmSLX 
+
+Next, also the spatially lagged x model retrieves somewhat similar results, but similarly fails to accout for spatial autocorrelation.
+
+```{r slx}
+slx_model2 <- lmSLX(formula, data = final_df, listw = wts)
+
+summary(slx_model2)
+```
+
+```{r slx-impact}
+summary(impacts(slx_model2))
+```
+
+```{r slx-autoregression}
+moran.test(slx_model2$residuals, wts)
+```
+
+## Spatial lag (lagsarlm)
+
+Ultimately, we fit the lagsarlm model again. Again, we get a statistically significant value of -0.004 for the impact of distance on turnout. Similarly, the Moran's I test shows that we have sucessfully accounted for spatial autocorrealtion. 
+
+```{r slm}
+lag_model2 <- lagsarlm(
+  formula = formula,
+  data = final_df,
+  listw = wts, 
+  zero.policy = T
+  )
+summary(lag_model2, Nagelkerke = TRUE)
+```
+
+```{r slm-impacts}
+imp <- impacts(lag_model2, listw = wts, R=100) 
+imp
+```
+
+```{r slm-impacts2}
+summary(imp, zstats=T)$pzmat
+```
+
+
+Again, we can rerun Moran's I with the model's residuals: 
+
+```{r slm-morans}
+moran.test(lag_model2$residuals, wts)
+```
+Ultimatly, we run the AIC test for comparing model performance, retrieving that the lag_model has the best fit.
+```{r AIC}
+AIC(model2, slx_model2, lag_model2)
+```
+
+# Conclusion 
+
+This project aimed on examining whether distance to polling stations has an effect on voter turnout, testing the hypothesis that a larger distance is associated with lower turnout. 
+
+For testing this hypothesis, I used several data sets containing information on the Federal election 2021 in Berlin. Berlin is separated into 2,257 voting districts with one corresponding polling station each. the hypothesis is tested on the district, not the individual level: Therefore, I used population density measured to calculate the distance between the polling station and the *population weighted centroid* of each district. 
+
+For testing the hypothesis, I fitted 2x3 models: The first three models used the distance between the geographic centroid and polling stations as a measure, neglecting that the geogrpahic centroid is not always the are where most individuals live. I then fitted three models (non-spatial OLS regression, spatially lagged x, and spatial lag model) for testing the hypothesis, finding a small but statistically significant effect of distance on turnout. 
+
+Secondly, I used an improved distance measure (distance between the population weighted centroid and the polling stations) and fitted the similar models. Again, a small negative effect was found (-0.004). 
+
+# Limitations
+
+There are several limitations that should be taken into account when interpreting the results: First, the analysis only focuses on in-person voting, neglecting whether larger distances might be avoided through postal voting. Additionally, voters are not formally required to use the polling station of their respective district, but could also request permission to vote in another polling station ("Wahlschein"). In doing so, individuals might avoid large distances on election day. Combining these two limitation, it should be stated that the framework predominantly focuses on individuals that spontaneously decide whether to vote on election day, not changing their polling station nor voting by post. 
+
+Regarding the models, it must be considered that the explanatory power is comparatively low and that the observed effects might be mediated by other, non-spatial variables that could not be taken into account here. The social sciences have identified numerous strong predictors of turnout in the past (most importantly, socio-demographic factors). Due to a lack of (free) available data on the district level, these predictors could not be considered here. Future research might include both a distance measure and several demographic variables controlling for the observed effects into their models.  
+
+# References
+
+Haspel, M., & Knotts, H. G. (2005). Location, location, location: Precinct placement and the
+costs of voting. The Journal of Politics, 67(2), 560-573.
+
+Garmann, S. (2017). The effect of a reduction in the opening hours of polling stations on
+turnout. Public Choice, 171, 99-117.
+
+Gomez, B. T., Hansford, T. G., & Krause, G. A. (2007). The Republicans should pray for rain:
+Weather, turnout, and voting in US presidential elections. The Journal of Politics, 69(3), 649-
+663.
+
+Orford, S., Railings, C., Thrasher, M., & Borisyuk, G. (2011). Changes in the probability of
+voter turnout when resiting polling stations: a case study in Brent, UK. Environment and
+Planning C: Government and Policy, 29(1), 149-169.
