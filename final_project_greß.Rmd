@@ -296,6 +296,10 @@ base_url <- "https://fbinter.stadt-berlin.de/fb/wfs/data/senstadt/s06_06ewdichte
 dichte <- st_read(base_url)
 
 dichte$centroid <- st_centroid(dichte$geom)
+
+# Checking CRS alignment
+st_crs(dichte) == st_crs(bezirke)
+st_crs(dichte) == st_crs(wahllokale)
 ```
 The next chunk adds the district ID based on the geographic location of the blocks in the density data. In the second step, the `wt.centroid` function from the `spatialEco` package is used to retrieved population weighted centroids per electoral district, using the column `ew2021` (population number) as weight: 
 
@@ -368,7 +372,9 @@ cleaned_distance_density <- ggplot(data = final_df, aes(x = cleaned_distance_num
 
 
 ggsave("cleaned_distance_density_plot.png", plot = cleaned_distance_density, width = 12, height = 8, dpi = 300)
-print(cleaned_distance_density)
+
+# Comparing the distribution of the two density measures
+print(cleaned_distance_density) + print(distance_density)
 ```
 
 # 3. Regression with advanced distance measure
