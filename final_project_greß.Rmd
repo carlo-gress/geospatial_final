@@ -49,6 +49,8 @@ library(tidyverse)
 library(terra)
 library(spatialreg)
 library(spatialEco)
+library(units)
+library(spdep)
 ```
 
 # 1. Data import: Districts, polling stations, and election results
@@ -61,7 +63,7 @@ wahllokale <- st_read("RBS_OD_Wahllokale_BTW_AH21/RBS_OD_Wahllokale_BTW_AH21.shp
 
 # Election results
 
-zweitstimme <- read_excel("DL_BE_BU2021.xlsx", 
+zweitstimme <-  readxl::read_excel("DL_BE_BU2021.xlsx", 
                          sheet = "BE_W2")
 
 # Checking CRS alignment
@@ -236,7 +238,7 @@ moran.test(model1$residuals, wts)
 ## Spatially lagged X model 
 
 After running a model which also includes a lagged version of the distance measure, we can see that there is a sign change between the direct (negative) and indirect impact (positive) on turnout. 
-```{r slx}
+```{r slx1}
 slx_model <- lmSLX(formula, data = final_df, listw = wts)
 
 summary(slx_model)
@@ -246,14 +248,14 @@ summary(impacts(slx_model))
 
 Again, we can check whether our model appropriately accounts for spatial autocorrelation by calculating Moran's I. Since the estimate is still positive and significant, there still is spatial autocorrelation in the model. 
 
-```{r slx-autoregression}
+```{r slx-autoregression1}
 moran.test(slx_model$residuals, wts)
 ```
 ## Spatial lag model
 
 Next, we are creating a spatial lag model that includes a spatial lag of the outcome variable. Since it seems likely that turnout rates are also dependent on the turnout of neighbouring districts, this seems reasonable. Again, we retrieve a small negative but significant effect of distance on turnout. This effect is only visible after calculating the indirect and direct impacts via Monte Carlo simulation. 
 
-```{r slm}
+```{r slm1}
 
 lag_model <- lagsarlm(
   formula = formula,
@@ -265,7 +267,7 @@ summary(lag_model, Nagelkerke = TRUE)
 ```
 Calculating the impacts:
 
-```{r slm-impacts}
+```{r slm-impacts1}
 imp <- impacts(lag_model, listw = wts, R=100) 
 imp
 
@@ -274,12 +276,12 @@ summary(imp, zstats=T)$pzmat
 
 Again, we can rerun Moran's I with the model's residuals, showing that there is no spatial autocorrelation left: 
 
-```{r slm-morans}
+```{r slm-morans1}
 moran.test(lag_model$residuals, wts)
 ```
 The AIC test reveals that the lag_model is the best fit. 
 
-```{r AIC}
+```{r AIC1}
 AIC(model1, slx_model, lag_model)
 ```
 
@@ -374,7 +376,8 @@ cleaned_distance_density <- ggplot(data = final_df, aes(x = cleaned_distance_num
 ggsave("cleaned_distance_density_plot.png", plot = cleaned_distance_density, width = 12, height = 8, dpi = 300)
 
 # Comparing the distribution of the two density measures
-print(cleaned_distance_density) + print(distance_density)
+print(cleaned_distance_density) 
+print(distance_density)
 ```
 
 # 3. Regression with advanced distance measure
@@ -406,17 +409,17 @@ moran.test(model2$residuals, wts)
 
 Next, also the spatially lagged x model retrieves somewhat similar results, but similarly fails to accout for spatial autocorrelation.
 
-```{r slx}
+```{r slx2}
 slx_model2 <- lmSLX(formula, data = final_df, listw = wts)
 
 summary(slx_model2)
 ```
 
-```{r slx-impact}
+```{r slx-impact2}
 summary(impacts(slx_model2))
 ```
 
-```{r slx-autoregression}
+```{r slx-autoregression2}
 moran.test(slx_model2$residuals, wts)
 ```
 
@@ -424,7 +427,7 @@ moran.test(slx_model2$residuals, wts)
 
 Ultimately, we fit the lagsarlm model again. Again, we get a statistically significant value of -0.004 for the impact of distance on turnout. Similarly, the Moran's I test shows that we have sucessfully accounted for spatial autocorrealtion. 
 
-```{r slm}
+```{r slm2}
 lag_model2 <- lagsarlm(
   formula = formula,
   data = final_df,
@@ -434,23 +437,23 @@ lag_model2 <- lagsarlm(
 summary(lag_model2, Nagelkerke = TRUE)
 ```
 
-```{r slm-impacts}
+```{r slm-impacts2}
 imp <- impacts(lag_model2, listw = wts, R=100) 
 imp
 ```
 
-```{r slm-impacts2}
+```{r slm-impacts3}
 summary(imp, zstats=T)$pzmat
 ```
 
 
 Again, we can rerun Moran's I with the model's residuals: 
 
-```{r slm-morans}
+```{r slm-morans2}
 moran.test(lag_model2$residuals, wts)
 ```
 Ultimatly, we run the AIC test for comparing model performance, retrieving that the lag_model has the best fit.
-```{r AIC}
+```{r AIC2}
 AIC(model2, slx_model2, lag_model2)
 ```
 
